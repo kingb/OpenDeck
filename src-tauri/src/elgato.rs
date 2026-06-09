@@ -1,20 +1,74 @@
 use crate::events::inbound;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use base64::Engine as _;
 use elgato_streamdeck::{
-	AsyncStreamDeck, DeviceStateUpdate,
+	AsyncStreamDeck, DeviceStateUpdate, StreamDeck,
 	images::{ImageRect, convert_image_with_format_async},
 	info::Kind,
 };
 use image::GenericImageView as _;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc, oneshot};
 
 static ELGATO_DEVICES: LazyLock<RwLock<HashMap<String, AsyncStreamDeck>>> = LazyLock::new(|| RwLock::new(HashMap::new()));
-static HIDAPI: LazyLock<RwLock<Option<Arc<hidapi::HidApi>>>> = LazyLock::new(|| RwLock::new(None));
+
+struct HidScan {
+	known: HashSet<String>,
+	reply: oneshot::Sender<Vec<(String, StreamDeck)>>,
+}
+
+/// On macOS, hidapi binds its `IOHIDManager` to the run loop of the thread that
+/// created the `HidApi`; enumerating or opening a device from another thread
+/// traps in CoreFoundation, most often right after sleep/wake. The async
+/// wrappers use `block_in_place`, which does not pin to one thread, so we own
+/// the `HidApi` on a dedicated thread and run every enumerate/open there via the
+/// sync API. Opened devices are `Send` and handed back for async use.
+static HID_TX: LazyLock<mpsc::UnboundedSender<HidScan>> = LazyLock::new(|| {
+	let (tx, rx) = mpsc::unbounded_channel::<HidScan>();
+	std::thread::Builder::new()
+		.name("opendeck-hid".to_owned())
+		.spawn(move || hid_thread_main(rx))
+		.expect("failed to spawn HID thread");
+	tx
+});
+
+fn hid_thread_main(mut rx: mpsc::UnboundedReceiver<HidScan>) {
+	let mut hid: Option<hidapi::HidApi> = None;
+	while let Some(scan) = rx.blocking_recv() {
+		let api = match &mut hid {
+			Some(api) => {
+				if let Err(error) = elgato_streamdeck::refresh_device_list(api) {
+					log::warn!("Failed to refresh HID device list: {error}");
+				}
+				api
+			}
+			None => match elgato_streamdeck::new_hidapi() {
+				Ok(api) => hid.insert(api),
+				Err(error) => {
+					log::warn!("Failed to initialise hidapi: {error}");
+					let _ = scan.reply.send(Vec::new());
+					continue;
+				}
+			},
+		};
+
+		let mut opened = Vec::new();
+		for (kind, serial) in elgato_streamdeck::list_devices(api) {
+			let device_id = format!("sd-{serial}");
+			if scan.known.contains(&device_id) {
+				continue;
+			}
+			match StreamDeck::connect(api, kind, &serial) {
+				Ok(device) => opened.push((device_id, device)),
+				Err(error) => log::warn!("Failed to connect to Elgato device: {error}"),
+			}
+		}
+		let _ = scan.reply.send(opened);
+	}
+}
 
 /// Extract the average colour from an image.
 fn extract_average_colour(img: &image::DynamicImage) -> (u8, u8, u8) {
@@ -188,32 +242,21 @@ pub async fn initialise_devices() {
 		crate::plugins::DEVICE_NAMESPACES.write().await.remove("sd");
 	}
 
-	// Iterate through detected Elgato devices and attempt to register them.
-	let current = HIDAPI.read().await.as_ref().cloned();
-	let hid = match current {
-		Some(arc) => arc,
-		None => match elgato_streamdeck::new_hidapi() {
-			Ok(hid) => {
-				let arc = Arc::new(hid);
-				HIDAPI.write().await.replace(arc.clone());
-				arc
-			}
-			Err(error) => {
-				log::warn!("Failed to initialise hidapi: {error}");
-				return;
-			}
-		},
+	// Enumerate and open devices on the dedicated HID thread (see HID_TX).
+	let known: HashSet<String> = ELGATO_DEVICES.read().await.keys().cloned().collect();
+	let (reply, rx) = oneshot::channel();
+	if HID_TX.send(HidScan { known, reply }).is_err() {
+		log::warn!("HID thread is gone; cannot enumerate devices");
+		return;
+	}
+	let opened = match rx.await {
+		Ok(opened) => opened,
+		Err(_) => {
+			log::warn!("HID thread dropped the scan request");
+			return;
+		}
 	};
-	for (kind, serial) in elgato_streamdeck::asynchronous::list_devices_async(&hid) {
-		let device_id = format!("sd-{serial}");
-		if ELGATO_DEVICES.read().await.contains_key(&device_id) {
-			continue;
-		}
-		match elgato_streamdeck::AsyncStreamDeck::connect(&hid, kind, &serial) {
-			Ok(device) => {
-				tokio::spawn(init(device, device_id));
-			}
-			Err(error) => log::warn!("Failed to connect to Elgato device: {error}"),
-		}
+	for (device_id, device) in opened {
+		tokio::spawn(init(AsyncStreamDeck::from(device), device_id));
 	}
 }
