@@ -20,7 +20,7 @@ serde_json = "1.0"
 tokio = { version = "1.48", features = ["full"] }
 tokio-tungstenite = "0.28"
 tiny_http = "0.12"
-elgato-streamdeck = { version = "0.12", default-features = false, features = ["async"] }
+elgato-streamdeck = { version = "0.13.1", default-features = false, features = ["async"] }
 hidapi = "2.6"
 image = { version = "0.25", default-features = false, features = ["bmp", "jpeg"] }
 # Smaller utility libraries
@@ -61,11 +61,3 @@ windows-sys = "0.61"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
-
-# elgato-streamdeck with an added `From<StreamDeck> for AsyncStreamDeck`, so
-# device enumeration/open can be pinned to a dedicated HID thread (see
-# elgato.rs). Fixes a macOS sleep/wake crash where hidapi's IOHIDManager was
-# driven from a foreign thread's run loop. Drop this patch once the upstream PR
-# lands in a release: https://github.com/OpenActionAPI/rust-elgato-streamdeck/pull/59
-[patch.crates-io]
-elgato-streamdeck = { git = "https://github.com/kingb/rust-elgato-streamdeck", branch = "feat/async-from-sync-0.12" }
